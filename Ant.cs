@@ -28,6 +28,7 @@ public class AntSimulationController : MonoBehaviour {
     }
 
     void Update() {
+        /*
         if (Input.GetMouseButtonDown(0)) {
             Vector2 mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
             AntSimulationCore.foodSources.Add(new FoodSource {
@@ -36,6 +37,7 @@ public class AntSimulationController : MonoBehaviour {
                 size = UnityEngine.Random.Range(0.5f, 2f)
             });
         }
+        */
         if(AntSimulationCore.pheromones.Count > 128) UpdatePheromonesWithJobSystem(Time.deltaTime);
         else AntSimulationCore.UpdatePheromoneAges(Time.deltaTime);
         AntSimulationCore.Update(Time.deltaTime);
