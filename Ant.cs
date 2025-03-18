@@ -23,7 +23,7 @@ public class AntSimulationController : MonoBehaviour {
 
     void Start() {
         AntSimulationCore.Initialize(colonySize, nestPosition, 3, worldSize, 0.5);
-        if(colonySize > 50) CreateAntsWithJobSystem(colonySize);
+        if(colonySize > 256) CreateAntsWithJobSystem(colonySize);
         else AntSimulationCore.CreateAnts(colonySize);
         SwitchRenderer(currentRenderMode);
     }
