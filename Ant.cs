@@ -29,22 +29,13 @@ public class AntSimulationController : MonoBehaviour {
     }
 
     void Update() {
-        if (Input.GetMouseButtonDown(0)) {
-            Vector2 mousePos = Camera.main.ScreenToWorldPoint(Input.mousePosition);
-            AntSimulationCore.foodSources.Add(new FoodSource {
-                position = mousePos,
-                mass = UnityEngine.Random.Range(50f, 200f),
-                size = UnityEngine.Random.Range(0.5f, 2f)
-            });
-        }
+        if (Input.GetMouseButtonDown(0)) AntSimulationCore.CreateNewFoodSource();
         if(AntSimulationCore.pheromones.Count > 256) UpdatePheromonesWithJobSystem(Time.deltaTime);
         else AntSimulationCore.UpdatePheromoneAges(Time.deltaTime);
         AntSimulationCore.Update(Time.deltaTime);
         UpdateSimulationData();
         
-        if(currentRenderMode != RenderMode.Gizmos) {
-            _activeRenderer.Draw(_simulationData);
-        }
+        if(currentRenderMode != RenderMode.Gizmos) _activeRenderer.Draw(_simulationData);
     }
 
     void OnDrawGizmos() {
@@ -106,7 +97,7 @@ public class AntSimulationController : MonoBehaviour {
         jobHandle.Complete();
         
         // Transfer results to AntSimulationCore
-            AntSimulationCore.ants = antJobData.Select(ajd => new AntData {
+        AntSimulationCore.ants = antJobData.Select(ajd => new AntData {
             baseData = ajd,
             pheromonesInRange = new List<PheromoneData>()
         }).ToList();
@@ -118,7 +109,7 @@ public class AntSimulationController : MonoBehaviour {
         int pheromoneCount = AntSimulationCore.pheromones.Count;
         if (pheromoneCount == 0) return;
         // Initialize native containers
-        using (var removeQueue = new NativeQueue<int>(Allocator.TempJob)) {
+        using (NativeQueue<int> removeQueue = new NativeQueue<int>(Allocator.TempJob)) {
             // Resize native array if needed
             if (!_pheromoneJobData.IsCreated || _pheromoneJobData.Length < pheromoneCount) {
                 if (_pheromoneJobData.IsCreated) _pheromoneJobData.Dispose();
@@ -170,50 +161,11 @@ public class AntSimulationController : MonoBehaviour {
         [ReadOnly] public float2 NestPosition;
         [ReadOnly] public float NestSize;
         public uint Seed;
-
         [WriteOnly] public NativeArray<AntJobData> Ants;
 
         public void Execute(int index) {
-            // Create a random number generator with a unique seed per ant
             var random = new Unity.Mathematics.Random(Seed + (uint)index);
-
-            // Generate random position within nest radius
-            float2 randomOffset = random.NextFloat2(-NestSize / 2, NestSize / 2);
-            float2 position = NestPosition + randomOffset;
-
-            // Generate random rotation
-            float rotation = random.NextFloat(0, 360f);
-
-            // Generate random values for ant properties using Unity.Mathematics.Random
-            float PheromoneIntervalValue = random.NextFloat(0f, 1f);
-            float PheromoneDecayRate = random.NextFloat(0f, 0.1f);
-            float PheromoneMaxAge = (1 - PheromoneIntervalValue) / PheromoneDecayRate;
-            float PheromoneMergeRadius = random.NextFloat(0f, 1f) / 10;
-            float Speed = random.NextFloat(0f, 1f) * 2;
-            float RotationSpeed = random.NextFloat(0f, 360f) / 2;
-            float MaxEnergy = (PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge) * 150;
-
-            // Create the ant data
-            AntJobData ant = new AntJobData {
-                position = position,
-                rotation = rotation,
-                isCarryingFood = 0, // false
-                pheromoneTimer = 0f,
-                pheromoneIntervalValue = PheromoneIntervalValue,
-                pheromoneDecayRate = PheromoneDecayRate,
-                pheromoneMaxAge = PheromoneMaxAge,
-                pheromoneMergeRadius = PheromoneMergeRadius,
-                sensorRadius = random.NextFloat(0f, 1f) * 2,
-                smellRadius = random.NextFloat(1f, 2f) * 2,
-                speed = Speed,
-                rotationSpeed = RotationSpeed,
-                maxEnergy = MaxEnergy,
-                energy = MaxEnergy,
-                energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / 10
-            };
-
-            // Store the ant
-            Ants[index] = ant;
+            Ants[index] = AntSimulationCore.CreateAnt(NestPosition, NestSize);
         }
     }
 
@@ -255,9 +207,11 @@ public struct AntJobData {
     public float pheromoneIntervalValue;
     public float pheromoneDecayRate;
     public float pheromoneMaxAge;
-    public float pheromoneMergeRadius; // Radius to check for nearby pheromones
+    public float pheromoneMergeRadius;
 
     public float sensorRadius;
+    public float sensorAngle;
+
     public float smellRadius;
 
     public float speed;
@@ -266,12 +220,15 @@ public struct AntJobData {
     public float energy;
     public float energyConsumptionRate;
     public float maxEnergy;
+
 }
 
 [System.Serializable]
 public struct AntData {
     public AntJobData baseData;
     public List<PheromoneData> pheromonesInRange;
+    public Vector2[] sensorPositions;
+    public float[] sensorStrengths;
 }
 
 [System.Serializable]
@@ -296,6 +253,7 @@ public static class AntSimulationCore {
     public static List<AntData> ants = new List<AntData>();
     public static List<PheromoneData> pheromones = new List<PheromoneData>();
     public static List<FoodSource> foodSources = new List<FoodSource>();
+    public static Unity.Mathematics.Random random = new Unity.Mathematics.Random((uint)System.DateTime.Now.Millisecond);
 
     public static void Initialize(int colonySize, Vector2 nestPos, int foodSourceCount, float WorldSize, double NestSize) {
         nestPosition = nestPos;
@@ -307,56 +265,58 @@ public static class AntSimulationCore {
         nestSize = NestSize;
         
         // Create food sources
-        for(int i = 0; i < foodSourceCount; i++) {
-            Vector2 pos;
-            do {
-                pos = new Vector2(
-                    UnityEngine.Random.Range(-worldSize/2, worldSize/2),
-                    UnityEngine.Random.Range(-worldSize/2, worldSize/2)
-                );
-            } while (Vector2.Distance(pos, nestPos) < worldSize * 0.01); // Ensure food isn't right at nest
-            float massa = UnityEngine.Random.Range(500f, 20000f);
-            foodSources.Add(new FoodSource {
-                position = pos,
-                mass = massa,
-                size = Mathf.Max(massa / 1000 , 0.01f)
+        for(int i = 0; i < foodSourceCount; i++) CreateNewFoodSource();
+    }
+
+    public static void CreateAnts(int ColonySize) {
+        for (int i = 0; i < ColonySize; i++) {
+            AntJobData ant = CreateAnt(nestPosition, (float)nestSize);
+            ants.Add(new AntData {
+                baseData = ant,
+                pheromonesInRange = new List<PheromoneData>(),
+                sensorPositions = new Vector2[3],
+                sensorStrengths = new float[3]
             });
         }
     }
 
-    public static void CreateAnts(int ColonySize) {
-        for(int i = 0; i < ColonySize; i++) {
-            float PheromoneIntervalValue = UnityEngine.Random.Range(0f, 1f);
-            float PheromoneDecayRate = UnityEngine.Random.Range(0f, 0.1f);
-            float PheromoneMaxAge = (1 - PheromoneIntervalValue) / PheromoneDecayRate;
-            float PheromoneMergeRadius = UnityEngine.Random.Range(0f, 1f) / 10;
-            float Speed = UnityEngine.Random.Range(0f, 1f) * 2;
-            float RotationSpeed = UnityEngine.Random.Range(0f, 360f) / 2;
-            float MaxEnergy = (PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge) * 150;
-            ants.Add(new AntData {
-                baseData = new AntJobData {
-                    position = new Vector2(nestPosition.x + UnityEngine.Random.Range((float)-nestSize / 2, (float)nestSize / 2), nestPosition.y + UnityEngine.Random.Range((float)-nestSize / 2, (float)nestSize / 2)),
-                    rotation = UnityEngine.Random.Range(0f, 360f),
-                    isCarryingFood = 0,
+    public static AntJobData CreateAnt(float2 nestPosition, float nestSize) {
+        float2 randomOffset = random.NextFloat2(-nestSize / 2, nestSize / 2);
+        float2 position = nestPosition + randomOffset;
 
-                    pheromoneTimer = 0,
-                    pheromoneIntervalValue = PheromoneIntervalValue,
-                    pheromoneDecayRate = PheromoneDecayRate,
-                    pheromoneMaxAge = PheromoneMaxAge,
-                    pheromoneMergeRadius = PheromoneMergeRadius,
+        float rotation = random.NextFloat(0, 360f);
 
-                    sensorRadius = UnityEngine.Random.Range(0f, 1f) * 2,
-                    smellRadius = UnityEngine.Random.Range(1f, 2f) * 2,
+        float PheromoneIntervalValue = random.NextFloat(0f, 1f);
+        float PheromoneDecayRate = random.NextFloat(0f, 0.1f);
+        float PheromoneMaxAge = PheromoneDecayRate / PheromoneIntervalValue;
+        float PheromoneMergeRadius = random.NextFloat(0f, 1f) / 10;
+        float Speed = random.NextFloat(0f, 1f) * 2;
+        float RotationSpeed = random.NextFloat(0f, 360f) / 2;
+        float MaxEnergy = ((PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge)) * 15;
+        float SensorAngle = random.NextFloat(30f, 60f); // Randomize sensor angle
 
-                    speed = Speed,
-                    rotationSpeed = RotationSpeed,
-                    maxEnergy = MaxEnergy,
-                    energy = MaxEnergy,
-                    energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / 10
-                },
-                pheromonesInRange = new List<PheromoneData>()
-            });
-        }
+        return new AntJobData {
+            position = position,
+            rotation = rotation,
+            isCarryingFood = 0,
+
+            pheromoneTimer = 0f,
+            pheromoneIntervalValue = PheromoneIntervalValue,
+            pheromoneDecayRate = PheromoneDecayRate,
+            pheromoneMaxAge = PheromoneMaxAge,
+            pheromoneMergeRadius = PheromoneMergeRadius,
+
+            sensorRadius = random.NextFloat(0.5f, 1f) * 2,
+            sensorAngle = SensorAngle,
+            smellRadius = random.NextFloat(1f, 2f) * 2,
+
+            speed = Speed,
+            rotationSpeed = RotationSpeed,
+            maxEnergy = MaxEnergy,
+            energy = MaxEnergy,
+            energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / 100
+
+        };
     }
 
     public static void UpdatePheromoneAges(float deltaTime) {
@@ -369,6 +329,27 @@ public static class AntSimulationCore {
                 } else {
                     pheromones[i] = pheromone;
                 }
+            }
+        }
+    }
+
+    public static void UpdatePheromonesInRange() {
+        // Clear the pheromonesInRange list for all ants
+        foreach (var antData in ants) antData.pheromonesInRange.Clear();
+
+        // Iterate over each pheromone and check which ants' sensors are in range
+        foreach (var pheromone in pheromones) {
+            for (int i = 0; i< ants.Count; i++) {
+                AntData ant = ants[i];
+                // Calculate sensor positions for the ant
+                Vector2[] sensorPositions = CalculateSensorPositions(ant.baseData);
+                // Check if the pheromone is within the range of any of the ant's sensors
+                foreach (var sensorPosition in sensorPositions) {
+                    float distance = Vector2.Distance(sensorPosition, pheromone.position);
+                    if (distance <= ant.baseData.sensorRadius) ant.pheromonesInRange.Add(pheromone);
+                }
+                ant.sensorPositions = sensorPositions;
+                ants[i] = ant;
             }
         }
     }
@@ -397,6 +378,7 @@ public static class AntSimulationCore {
                     if (Vector2.Distance(ant.position, food.position) <= (float)food.size) {
                         ant.isCarryingFood = 1;
                         ant.rotation += 180f;
+                        ant.rotation = NormaliseAngle(ant.rotation);
                         // Update food source
                         FoodSource updatedFood = food;
                         updatedFood.mass -= 1f;
@@ -414,14 +396,16 @@ public static class AntSimulationCore {
                 
                 // Turn around to leave nest
                 ant.rotation += 180f;
+                ant.rotation = NormaliseAngle(ant.rotation);
             }
             // Update ant direction based on pheromones
-            UpdateAntDirection(ref ant, deltaTime);
+            UpdateAntDirection(ref antData, deltaTime);
             // Move ant
-            ant.position += new float2(Mathf.Cos(ant.rotation * Mathf.Deg2Rad), Mathf.Sin(ant.rotation * Mathf.Deg2Rad)) * ant.speed * deltaTime;
+            ant.position += new float2(math.cos(ant.rotation * Mathf.Deg2Rad), math.sin(ant.rotation * Mathf.Deg2Rad)) * ant.speed * deltaTime;
             if (ant.position.x < -worldSize/2 || ant.position.x > worldSize/2 || ant.position.y < -worldSize/2 || ant.position.y > worldSize/2) {
                 ant.position = nestPosition;
                 ant.rotation += 180f;
+                ant.rotation = NormaliseAngle(ant.rotation);
             }
             antData.baseData = ant;
             ants[i] = antData;
@@ -430,114 +414,137 @@ public static class AntSimulationCore {
 
     public static void Update(float deltaTime) {
         simulationTime += deltaTime;
+        UpdatePheromonesInRange();
         UpdateAnts(deltaTime);
-        // Check for depleted food sources
+        UpdateFoodSources();
+    }
+
+    public static void UpdateFoodSources() {
         if (foodSources.Count > 0) {
             for (int i = foodSources.Count - 1; i >= 0; i--) {
-                if (foodSources[i].mass <= 0) {
-                    foodSources.RemoveAt(i);
-                }
+                if (foodSources[i].mass <= 0) foodSources.RemoveAt(i);
             }
         }
+        else CreateNewFoodSource();
+    }
+
+    public static void CreateNewFoodSource() {
+        Vector2 pos;
+        do {
+            pos = new Vector2(
+                UnityEngine.Random.Range(-worldSize/2, worldSize/2),
+                UnityEngine.Random.Range(-worldSize/2, worldSize/2)
+            );
+        } while (Vector2.Distance(pos, nestPosition) < worldSize * 0.05f);
+        float massa = UnityEngine.Random.Range(500f, 20000f);
+        foodSources.Add(new FoodSource {
+            position = pos,
+            mass = massa,
+            size = Mathf.Max(massa / 1000f, 0.01f)
+        });
+    }
+    private static Vector2[] CalculateSensorPositions(AntJobData ant) {
+        Vector2[] sensorPositions = new Vector2[3];
+        float antDirection = ant.rotation * Mathf.Deg2Rad;
+        // Front sensor
+        sensorPositions[0] = ant.position + new float2(
+            math.cos(antDirection) * ant.sensorRadius,
+            math.sin(antDirection) * ant.sensorRadius
+        );
+        // Left sensor
+        sensorPositions[1] = ant.position + new float2(
+            math.cos(antDirection - ant.sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius,
+            math.sin(antDirection - ant.sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius
+        );
+        // Right sensor
+        sensorPositions[2] = ant.position + new float2(
+            math.cos(antDirection + ant.sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius,
+            math.sin(antDirection + ant.sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius
+        );
+        return sensorPositions;
     }
     
-    private static void UpdateAntDirection(ref AntJobData ant, float deltaTime) {
+    private static void UpdateAntDirection(ref AntData antData, float deltaTime) {
+        AntJobData ant = antData.baseData;
         // Special case: If carrying food and near nest, steer toward nest
         if (ant.isCarryingFood == 1) {
             float distToNest = Vector2.Distance(ant.position, nestPosition);
-            if (distToNest < nestSize * 1.75) { 
+            if (distToNest < nestSize + ant.smellRadius) {
                 float2 dirToNest = (float2)nestPosition - ant.position;
                 float targetAngle = Mathf.Atan2(dirToNest.y, dirToNest.x) * Mathf.Rad2Deg;
                 float angleDiff = Mathf.DeltaAngle(ant.rotation, targetAngle);
                 ant.rotation += Mathf.Clamp(angleDiff, -ant.rotationSpeed, ant.rotationSpeed);
+                ant.rotation = NormaliseAngle(ant.rotation);
                 return;
             }
         }
+        else {
         // Special case: If not carrying food and near food, steer toward food
-        if (ant.isCarryingFood == 0) {
             float closestFoodDistance = float.MaxValue;
             FoodSource? closestSource = null;
-            for(int i = 0; i < foodSources.Count; i++){
+            for (int i = 0; i < foodSources.Count; i++) {
                 float distToFood = Vector2.Distance(ant.position, foodSources[i].position);
-                if(distToFood < closestFoodDistance) {
+                if (distToFood < closestFoodDistance) {
                     closestSource = foodSources[i];
                     closestFoodDistance = distToFood;
                 }
             }
-            if(closestSource != null) {
+            if (closestSource != null) {
                 if (closestFoodDistance <= ant.smellRadius + closestSource.Value.size) {
                     Vector2 dirToFood = (float2)closestSource.Value.position - ant.position;
                     float targetAngle = Mathf.Atan2(dirToFood.y, dirToFood.x) * Mathf.Rad2Deg;
                     float angleDiff = Mathf.DeltaAngle(ant.rotation, targetAngle);
                     ant.rotation += Mathf.Clamp(angleDiff, -ant.rotationSpeed, ant.rotationSpeed);
+                    ant.rotation = NormaliseAngle(ant.rotation);
                     return;
                 }
             }
         }
-        // Create sensors at different angles around the ant
-        Vector2[] sensorPositions = new Vector2[3];
-        float[] sensorStrengths = new float[3];
-        // Front, left and right sensors
-        float sensorAngle = 60f;
-        float antDirection = ant.rotation * Mathf.Deg2Rad;
-        sensorPositions[0] = ant.position + new float2(
-            Mathf.Cos(antDirection) * ant.sensorRadius,
-            Mathf.Sin(antDirection) * ant.sensorRadius
-        );
-        sensorPositions[1] = ant.position + new float2(
-            Mathf.Cos(antDirection - sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius,
-            Mathf.Sin(antDirection - sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius
-        );
-        sensorPositions[2] = ant.position + new float2(
-            Mathf.Cos(antDirection + sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius,
-            Mathf.Sin(antDirection + sensorAngle * Mathf.Deg2Rad) * ant.sensorRadius
-        );
-        
-        // Calculate pheromone concentrations at each sensor
-        for (int i = 0; i < sensorPositions.Length; i++) {
-            sensorStrengths[i] = 0f;
-            foreach (var pheromone in pheromones) {
-                // Check if this is the right type of pheromone for the ant's state
-                bool relevantPheromone = (ant.isCarryingFood == 1) ? true : (pheromone.owner.isCarryingFood == 1);
-                float distance = Vector2.Distance(sensorPositions[i], pheromone.position);
-                float distanceHome = Vector2.Distance(pheromone.position, nestPosition);
-                float antDistanceHome = Vector2.Distance(ant.position, nestPosition);
-                float directionStrength = 0;
-                if (relevantPheromone && ant.isCarryingFood == 0) {
-                    if (distance <= ant.sensorRadius) {
-                        directionStrength = (distanceHome > antDistanceHome) ? distanceHome / antDistanceHome : -distanceHome / antDistanceHome;
-                        sensorStrengths[i] += directionStrength;
-                    }
-                }
-                if (relevantPheromone && ant.isCarryingFood == 1) {
-                    if (distance <= ant.sensorRadius) {
-                        directionStrength = (distanceHome < antDistanceHome) ? antDistanceHome / distanceHome : -antDistanceHome / distanceHome;
-                        sensorStrengths[i] += directionStrength;
-                    }
-                }
-            }
-        }
-        
+        // Get the ant's data to access sensors
+        antData.sensorStrengths = new float[3];
         // Check if any sensor detected pheromones
-        bool pheromoneDetected = sensorStrengths[0] > 0 || sensorStrengths[1] > 0 || sensorStrengths[2] > 0;
-        if (pheromoneDetected) {
-            // Determine turning direction based on sensor readings
-            if (sensorStrengths[1] > sensorStrengths[0] && sensorStrengths[1] > sensorStrengths[2]) {
-                // Left sensor strongest, turn left
-                ant.rotation -= ant.rotationSpeed;
-            } 
-            else if (sensorStrengths[2] > sensorStrengths[0] && sensorStrengths[2] > sensorStrengths[1]) {
-                // Right sensor strongest, turn right
-                ant.rotation += ant.rotationSpeed;
+        bool pheromoneDetected = antData.pheromonesInRange.Count > 0;
+        // Calculate pheromone concentrations at each sensor
+        if(pheromoneDetected) {
+            for (int i = 0; i < antData.sensorPositions.Length; i++) {
+                antData.sensorStrengths[i] = 0f;
+                foreach (var pheromone in antData.pheromonesInRange) {
+                    float sensorDistanceToPheromone = Vector2.Distance(pheromone.position, antData.sensorPositions[i]);
+                    if(sensorDistanceToPheromone <= ant.sensorRadius) {
+                        bool relevantPheromone = (ant.isCarryingFood == 1) ? true : (pheromone.owner.isCarryingFood == 1);
+                        float distanceHome = Vector2.Distance(pheromone.position, nestPosition);
+                        float antDistanceHome = Vector2.Distance(ant.position, nestPosition);
+                        if (relevantPheromone) {
+                            float directionStrength = (ant.isCarryingFood == 1) ? ((distanceHome < antDistanceHome) ? antDistanceHome / distanceHome : -antDistanceHome / distanceHome) : 
+                                                                            ((distanceHome > antDistanceHome) ? distanceHome / antDistanceHome : -distanceHome / antDistanceHome);
+                            float distanceStrength = distanceHome / directionStrength;
+                            float sensorDistanceStrength = sensorDistanceToPheromone / ant.sensorRadius;
+                            float totalStrength = (distanceStrength * sensorDistanceStrength) / 10;
+                            antData.sensorStrengths[i] += totalStrength;
+                        }
+                    }
+                }
             }
-            // Otherwise continue straight (center sensor strongest)
-            return;
+            // Calculate the direction of rotation based on sensor strengths
+            float rotationDirection = (antData.sensorStrengths[1] > antData.sensorStrengths[0] && antData.sensorStrengths[1] > antData.sensorStrengths[2]) ? -1f :
+                                      (antData.sensorStrengths[2] > antData.sensorStrengths[0] && antData.sensorStrengths[2] > antData.sensorStrengths[1]) ? 1f : 0f;
+            // Apply the rotation
+            ant.rotation += rotationDirection * ant.rotationSpeed;
+            ant.rotation = NormaliseAngle(ant.rotation);
         }
-        
-        // No pheromones detected, use random movement with occasional direction changes
-        if (UnityEngine.Random.value < 0.02f) { // 2% chance per frame to change direction
-            ant.rotation += UnityEngine.Random.Range(-ant.rotationSpeed, ant.rotationSpeed);
+        else {
+            // No pheromones detected, use random movement
+            if (UnityEngine.Random.value < 0.02f) {
+                ant.rotation += UnityEngine.Random.Range(-ant.rotationSpeed, ant.rotationSpeed);
+                ant.rotation = NormaliseAngle(ant.rotation);
+            }
         }
+    }
+
+    public static float NormaliseAngle(float Angle) {
+        Angle = Angle % 360f; // Normalize rotation
+        if (Angle < 0) Angle += 360f;
+        return Angle;
     }
 
     public static void DepositPheromone(AntJobData ant) {
@@ -607,7 +614,7 @@ public class GizmoRenderer : ISimulationRenderer {
     }
 
     private void DrawAnts(List<AntData> ants) {
-        foreach(var ant in ants) {
+        foreach (var ant in ants) {
             Gizmos.color = (ant.baseData.isCarryingFood == 1) ? Color.yellow : _antColor;
             Gizmos.DrawCube(new Vector3(ant.baseData.position.x, ant.baseData.position.y, 0), Vector3.one * 0.2f);
         }
