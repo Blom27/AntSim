@@ -1,4 +1,5 @@
-How to Run This Simulation
+How to Run This Simulation.
+
 Setup:
 Create a new Unity project.
 Add this script to a GameObject in the scene.
