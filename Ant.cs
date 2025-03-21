@@ -8,6 +8,12 @@ using Unity.Collections.LowLevel.Unsafe;
 using System.Linq;
 
 public class AntSimulationController : MonoBehaviour {
+    public bool drawPheromones = true;
+    [Range(1, 2)]
+    public float simulationSpeed = 1;
+    public int pheromoneThreshold = 10000;
+    [Range(float.Epsilon, 1 - float.Epsilon)]
+    public float pheromoneTrimPercentage = 0.1f;
     public enum RenderMode { Gizmos/*, Sprites, ThreeD*/ }
     
     [Header("Simulation Settings")]
@@ -23,35 +29,57 @@ public class AntSimulationController : MonoBehaviour {
     private NativeArray<PheromoneData> _pheromoneJobData;
 
     void Start() {
-        _simulationData = AntSimulationCore.Initialize(_simulationData, colonySize, nestPosition, 3, worldSize, 0.5f);
+        _simulationData = AntSimulationCore.Initialize(_simulationData, nestPosition, 3, worldSize, 0.5f);
+        _simulationData.PheromoneThreshold = pheromoneThreshold;
         if(colonySize > 256) CreateAntsWithJobSystem(colonySize);
-        else _simulationData = AntSimulationCore.CreateAnts(_simulationData);
+        else _simulationData = AntSimulationCore.CreateAnts(colonySize, _simulationData);
         SwitchRenderer(currentRenderMode);
     }
 
     void Update() {
         if (_simulationData.Ants.Count > 0) {
+            _simulationData.PheromoneThreshold = pheromoneThreshold;
             if (Input.GetMouseButtonDown(0)) _simulationData.FoodSources.Add(AntSimulationCore.CreateNewFoodSource(_simulationData));
             if(_simulationData.Pheromones.Count > 64){
-                _simulationData = AntSimulationCore.UpdateAntEnergy(_simulationData);
-                UpdatePheromonesWithJobSystem(Time.deltaTime);
-                _simulationData = AntSimulationCore.UpdatePheromoneTimers(_simulationData);
                 _simulationData = AntSimulationCore.LocationCheck(_simulationData);
+                _simulationData.SimulationTime = Time.deltaTime * simulationSpeed;
+                _simulationData = AntSimulationCore.UpdateFoodSources(_simulationData);
+                _simulationData = AntSimulationCore.UpdateAntEnergy(_simulationData);
+                UpdatePheromonesWithJobSystem(Time.deltaTime * simulationSpeed);
+                _simulationData = AntSimulationCore.UpdatePheromoneTimers(_simulationData);
+                _simulationData = AntSimulationCore.UpdateAntDirections(_simulationData);
                 _simulationData = AntSimulationCore.ClearPheromonesInRangeAndPositionSensors(_simulationData);
                 UpdatePheromonesInRangeWithJobSystem();
                 _simulationData = AntSimulationCore.UpdateAntRotations(_simulationData);
-                _simulationData = AntSimulationCore.UpdateAntDirections(_simulationData);
                 _simulationData = AntSimulationCore.MoveAnts(_simulationData); // Move ants
-                _simulationData = AntSimulationCore.UpdateFoodSources(_simulationData);
             }
-            else _simulationData = AntSimulationCore.Update(_simulationData, Time.deltaTime);
+            else _simulationData = AntSimulationCore.Update(_simulationData, Time.deltaTime * simulationSpeed);
+            _simulationData = AntSimulationCore.OrganiseLists(_simulationData);
+            int antCount = _simulationData.Ants.Count;
+            int colonySize = _simulationData.ColonySize;
+            if(antCount <= colonySize * 0.5) {
+                int diff = colonySize - antCount;
+                for (int i = 0; i < diff / 2; i++) {
+                    _simulationData.Ants.Add(new AntData {
+                        baseData = AntSimulationCore.CreateOffspring(_simulationData, math.max(2, (int)(diff / 10))),
+                        pheromoneIndiciesInRange = new HashSet<int>(),
+                        foodCollected = 0
+                    });
+                }
+                antCount = _simulationData.Ants.Count;
+            }
         }
-        if(currentRenderMode != RenderMode.Gizmos) _activeRenderer.Draw(_simulationData);
+        if(_simulationData.Pheromones.Count >= pheromoneThreshold * 1.1) {
+            for(int i = 0; i < pheromoneThreshold * pheromoneTrimPercentage; i++) {
+                _simulationData.Pheromones.RemoveAt(0);
+            } 
+        }
+        if(currentRenderMode != RenderMode.Gizmos) _activeRenderer.Draw(_simulationData, drawPheromones);
     }
 
     void OnDrawGizmos() {
         if(currentRenderMode == RenderMode.Gizmos && Application.isPlaying) {
-            _activeRenderer.Draw(_simulationData);
+            _activeRenderer.Draw(_simulationData, drawPheromones);
         }
     }
     
@@ -87,8 +115,7 @@ public class AntSimulationController : MonoBehaviour {
         var createAntsJob = new CreateAntsJob {
             NestPosition = new float2(nestPosition.x, nestPosition.y),
             NestSize = _simulationData.NestSize,
-            Ants = antJobData,
-            Seed = (uint)System.DateTime.Now.Millisecond
+            Ants = antJobData
         };
         
         // Execute the job
@@ -98,8 +125,10 @@ public class AntSimulationController : MonoBehaviour {
         // Transfer results to AntSimulationCore
         _simulationData.Ants = antJobData.Select(ajd => new AntData {
             baseData = ajd,
-            pheromonesInRange = new List<PheromoneData>()
+            pheromoneIndiciesInRange = new HashSet<int>(),
+            foodCollected = 0
         }).ToList();
+        _simulationData.ColonySize = _simulationData.Ants.Count;
 
         antJobData.Dispose();
     }
@@ -164,9 +193,6 @@ public class AntSimulationController : MonoBehaviour {
         NativeArray<AntJobData> antJobData = new NativeArray<AntJobData>(antCount, Allocator.TempJob);
         NativeArray<PheromoneData> pheromoneJobData = new NativeArray<PheromoneData>(pheromoneCount, Allocator.TempJob);
         NativeArray<float2> sensorPositions = new NativeArray<float2>(antCount * 3, Allocator.TempJob); // 3 sensors per ant
-        UnsafeParallelMultiHashMap<int, PheromoneData> pheromonesInRangeMap = new UnsafeParallelMultiHashMap<int, PheromoneData>(pheromoneCount * 3, Allocator.TempJob);
-
-        NativeParallelHashSet<int> antsProcessedMap = new NativeParallelHashSet<int>(antCount + 1, Allocator.TempJob);
 
         // Copy data to native arrays
         for (int i = 0; i < antCount; i++) {
@@ -181,35 +207,75 @@ public class AntSimulationController : MonoBehaviour {
             pheromoneJobData[i] = _simulationData.Pheromones[i];
         }
 
-        // Set up and schedule the job
-        var updatePheromonesInRangeJob = new UpdatePheromonesInRangeJob {
-            Ants = antJobData,
-            Pheromones = pheromoneJobData,
-            SensorPositions = sensorPositions,
-            PheromonesInRangeMap = pheromonesInRangeMap.AsParallelWriter(),
-            AntsProcessedMap = antsProcessedMap.AsParallelWriter()
-        };
+        // Define chunk size (e.g., 64 pheromones per job)
+        int chunkSize = 64;
+        int numChunks = (int)(pheromoneCount / chunkSize) + 1;
 
-        JobHandle jobHandle = updatePheromonesInRangeJob.Schedule(pheromoneCount, 64);
-        jobHandle.Complete();
+        // Create arrays to store job handles and results
+        NativeArray<JobHandle> jobHandles = new NativeArray<JobHandle>(numChunks, Allocator.Temp);
+        NativeArray<UnsafeParallelMultiHashMap<int, int>> pheromoneMaps = new NativeArray<UnsafeParallelMultiHashMap<int, int>>(numChunks, Allocator.Temp);
 
-        // Transfer results back to the simulation data
-        for (int i = 0; i < antCount; i++) {
-            _simulationData.Ants[i].pheromonesInRange.Clear();
+        // Launch jobs for each chunk
+        for (int chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
+            int chunkStartIndex = chunkIndex * chunkSize;
+            int chunkEndIndex = math.min(chunkStartIndex + chunkSize, pheromoneCount);
+
+            // Create a new map for this job
+            pheromoneMaps[chunkIndex] = new UnsafeParallelMultiHashMap<int, int>(antCount, Allocator.TempJob);
+
+            var processJob = new ProcessPheromonesJob {
+                Ants = antJobData,
+                Pheromones = pheromoneJobData,
+                SensorPositions = sensorPositions,
+                PheromonesInRangeMap = pheromoneMaps[chunkIndex],
+                StartIndex = chunkStartIndex,
+                EndIndex = chunkEndIndex
+            };
+
+            // Schedule the job
+            jobHandles[chunkIndex] = processJob.Schedule();
         }
 
-        foreach (var pair in pheromonesInRangeMap) {
-            if (!_simulationData.Ants[pair.Key].pheromonesInRange.Contains(pair.Value)) {
-                _simulationData.Ants[pair.Key].pheromonesInRange.Add(pair.Value);
+        // Wait for all jobs to complete
+        JobHandle.CompleteAll(jobHandles);
+
+        // Combine results from all jobs
+        HashSet<int> pheromonesToRemove = new HashSet<int>();
+        for (int chunkIndex = 0; chunkIndex < numChunks; chunkIndex++) {
+            foreach (var pair in pheromoneMaps[chunkIndex]) {
+                int antIndex = pair.Key;
+                int pheromoneIndex = pair.Value;
+
+                if (antIndex == -1) {
+                    // This pheromone is marked for removal
+                    if(_simulationData.Pheromones.Count >= pheromoneThreshold) pheromonesToRemove.Add(pheromoneIndex);
+                } else {
+                    // Add the pheromone to the ant's pheromonesInRange list
+                    if (!_simulationData.Ants[antIndex].pheromoneIndiciesInRange.Contains(pheromoneIndex)) {
+                        _simulationData.Ants[antIndex].pheromoneIndiciesInRange.Add(pheromoneIndex);
+                    }
+                }
             }
         }
+
+        // Remove irrelevant pheromones
+        List<PheromoneData> newPheromones = new List<PheromoneData>();
+        for (int i = 0; i < pheromoneCount; i++) {
+            if (!pheromonesToRemove.Contains(i)) {
+                newPheromones.Add(_simulationData.Pheromones[i]);
+            }
+        }
+        _simulationData.Pheromones = newPheromones;
 
         // Dispose native containers
         antJobData.Dispose();
         pheromoneJobData.Dispose();
         sensorPositions.Dispose();
-        pheromonesInRangeMap.Dispose();
-        antsProcessedMap.Dispose();
+        for (int i = 0; i < numChunks; i++) {
+            pheromoneMaps[i].Dispose();
+        }
+        jobHandles.Dispose();
+        pheromoneMaps.Dispose();
     }
 }
 
@@ -220,8 +286,8 @@ public class GizmoRenderer : ISimulationRenderer {
 
     public void Initialize() { /* Not needed for Gizmos */ }
 
-    public void Draw(AntSimulationData data) {
-        DrawPheromones(data.Pheromones);
+    public void Draw(AntSimulationData data, bool drawPheromones = true) {
+        if (drawPheromones)DrawPheromones(data.Pheromones);
         DrawNest(data.NestPosition);
         DrawAnts(data.Ants);
         DrawFood(data.FoodSources);
@@ -266,10 +332,10 @@ public static class AntSimulationCore {
 
     public static Unity.Mathematics.Random random = new Unity.Mathematics.Random((uint)System.DateTime.Now.Millisecond);
 
-    public static AntSimulationData Initialize(AntSimulationData simData, int colonySize, Vector2 nestPos, int foodSourceCount, float WorldSize, float NestSize) {
+    public static AntSimulationData Initialize(AntSimulationData simData, Vector2 nestPos, int foodSourceCount, float WorldSize, float NestSize) {
         simData = new AntSimulationData {
             SimulationTime = 0f,
-            ColonySize = colonySize,
+            ColonySize = 0,
             NestPosition = nestPos,
             NestSize = NestSize,
             WorldSize = WorldSize,
@@ -282,12 +348,13 @@ public static class AntSimulationCore {
         return simData;
     }
 
-    public static AntSimulationData CreateAnts(AntSimulationData simData) {
+    public static AntSimulationData CreateAnts(int colonySize, AntSimulationData simData) {
+        simData.ColonySize += colonySize;
         for (int i = 0; i < simData.ColonySize; i++) {
             AntJobData ant = CreateAnt(simData.NestPosition, simData.NestSize);
             simData.Ants.Add(new AntData {
                 baseData = ant,
-                pheromonesInRange = new List<PheromoneData>(),
+                pheromoneIndiciesInRange = new HashSet<int>(),
                 sensorPositions = new float2[3],
                 sensorStrengths = new float[3]
             });
@@ -303,12 +370,13 @@ public static class AntSimulationCore {
 
         float PheromoneIntervalValue = random.NextFloat(0f, 1f);
         float PheromoneDecayRate = random.NextFloat(0f, 0.1f);
-        float PheromoneMaxAge = PheromoneDecayRate / PheromoneIntervalValue;
-        float PheromoneMergeRadius = random.NextFloat(0f, 1f) / 10;
+        float PheromoneMaxAge = PheromoneIntervalValue / PheromoneDecayRate;
+        float PheromoneMergeRadius = random.NextFloat(float.Epsilon, 1f) * 0.05f;
         float Speed = random.NextFloat(0f, 1f) * 2;
         float RotationSpeed = random.NextFloat(0f, 360f) / 2;
-        float MaxEnergy = ((PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge)) * 15;
+        float MaxEnergy = ((PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge)) * 10;
         float SensorAngle = random.NextFloat(30f, 60f); // Randomize sensor angle
+        float SensorRadius= random.NextFloat(0.5f, 1f) * 2;
 
         return new AntJobData {
             position = position,
@@ -321,16 +389,73 @@ public static class AntSimulationCore {
             pheromoneMaxAge = PheromoneMaxAge,
             pheromoneMergeRadius = PheromoneMergeRadius,
 
-            sensorRadius = random.NextFloat(0.5f, 1f) * 2,
+            sensorRadius = SensorRadius,
             sensorAngle = SensorAngle,
-            smellRadius = random.NextFloat(1f, 2f) * 2,
+            smellRadius = (3 - SensorRadius) / 2,
 
             speed = Speed,
             rotationSpeed = RotationSpeed,
             maxEnergy = MaxEnergy,
             energy = MaxEnergy,
-            energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / 100
+            energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / MaxEnergy
 
+        };
+    }
+
+    public static AntJobData CreateOffspring(AntSimulationData simData, int parentCount) {
+        float2 randomOffset = random.NextFloat2(-simData.NestSize / 2, simData.NestSize / 2);
+        float2 position = simData.NestPosition + randomOffset;
+        float rotation = 0;
+        float PheromoneIntervalValue = 0;
+        float PheromoneDecayRate = 0;
+        float PheromoneMaxAge = PheromoneIntervalValue / PheromoneDecayRate;
+        float PheromoneMergeRadius = 0;
+        float Speed = 0;
+        float RotationSpeed = 0;
+        float MaxEnergy = ((PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge)) * 10;
+        float SensorAngle = 0; // Randomize sensor angle
+        float SensorRadius= 0;
+        float SmellRadius = (3 - SensorRadius) / 2;
+        for(int i = 0; i < parentCount; i++) {
+            int randomIndex = random.NextInt(0, simData.ColonySize / 10);
+            rotation += simData.Ants[i + randomIndex].baseData.rotation;
+            PheromoneIntervalValue += simData.Ants[i + randomIndex].baseData.pheromoneIntervalValue;
+            PheromoneDecayRate += simData.Ants[i + randomIndex].baseData.pheromoneDecayRate;
+            PheromoneMergeRadius += simData.Ants[i + randomIndex].baseData.pheromoneMergeRadius;
+            Speed += simData.Ants[i].baseData.speed;
+            RotationSpeed += simData.Ants[i + randomIndex].baseData.rotationSpeed;
+            SensorAngle += simData.Ants[i + randomIndex].baseData.sensorAngle;
+            SensorRadius += simData.Ants[i + randomIndex].baseData.sensorRadius;
+        }
+        rotation /= parentCount;
+        PheromoneIntervalValue /= parentCount;
+        PheromoneDecayRate /= parentCount;
+        PheromoneMergeRadius /= parentCount;
+        Speed /= parentCount;
+        RotationSpeed /= parentCount;
+        SensorAngle /= parentCount;
+        SensorRadius /= parentCount;
+
+        return new AntJobData {
+            position = position,
+            rotation = rotation,
+            isCarryingFood = 0,
+
+            pheromoneTimer = 0f,
+            pheromoneIntervalValue = PheromoneIntervalValue,
+            pheromoneDecayRate = PheromoneDecayRate,
+            pheromoneMaxAge = PheromoneMaxAge,
+            pheromoneMergeRadius = PheromoneMergeRadius,
+
+            sensorRadius = SensorRadius,
+            sensorAngle = SensorAngle,
+            smellRadius = SmellRadius,
+
+            speed = Speed,
+            rotationSpeed = RotationSpeed,
+            maxEnergy = MaxEnergy,
+            energy = MaxEnergy,
+            energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / MaxEnergy
         };
     }
 
@@ -350,7 +475,7 @@ public static class AntSimulationCore {
         // Clear the pheromonesInRange list for all ants
         for (int i = 0; i < simData.Ants.Count; i++) {
             AntData ant = simData.Ants[i];
-            ant.pheromonesInRange.Clear();
+            ant.pheromoneIndiciesInRange.Clear();
             ant.sensorPositions = CalculateSensorPositions(ant.baseData); // Calculate sensor positions for the ant
             simData.Ants[i] = ant;
         }
@@ -360,14 +485,22 @@ public static class AntSimulationCore {
     public static AntSimulationData UpdatePheromonesInRange(AntSimulationData simData) {
         // Iterate over each pheromone and check which ants' sensors are in range
         for (int pheromone = 0; pheromone < simData.Pheromones.Count; pheromone++) {
+            bool relevant = false;
             for (int i = 0; i < simData.Ants.Count; i++) {
                 AntData ant = simData.Ants[i];
                 // Check if the pheromone is within the range of any of the ant's sensors
                 foreach (float2 sensorPosition in ant.sensorPositions) {
                     float distance = Vector2.Distance(sensorPosition, simData.Pheromones[pheromone].position);
-                    if (distance <= ant.baseData.sensorRadius) ant.pheromonesInRange.Add(simData.Pheromones[pheromone]);
+                    if (distance <= ant.baseData.sensorRadius) {
+                        ant.pheromoneIndiciesInRange.Add(pheromone);
+                        relevant = true;
+                    }
                 }
                 simData.Ants[i] = ant;
+            }
+            if(!relevant && simData.PheromoneThreshold > simData.Pheromones.Count) {
+                simData.Pheromones.RemoveAt(pheromone);
+                pheromone--;
             }
         }
         return simData;
@@ -419,6 +552,7 @@ public static class AntSimulationCore {
                         ant.isCarryingFood = 1;
                         ant.rotation += 180f;
                         ant.rotation = NormaliseAngle(ant.rotation);
+                        antData.foodCollected++;
                         // Update food source
                         FoodSource updatedFood = food;
                         updatedFood.mass -= 1f;
@@ -429,7 +563,7 @@ public static class AntSimulationCore {
                 }
             }
             // Check if ant reached nest
-            else if (Vector2.Distance(ant.position, simData.NestPosition) <= simData.NestSize) {
+            else if (Vector2.Distance(ant.position, simData.NestPosition) <= simData.NestSize * 2) {
                 // Ant delivered food!
                 ant.isCarryingFood = 0;
                 ant.energy = ant.maxEnergy; // Reward energy
@@ -448,16 +582,22 @@ public static class AntSimulationCore {
         for (int i = 0; i < simData.Ants.Count; i++) {
             AntData antData = simData.Ants[i]; // Get the struct
             AntJobData ant = antData.baseData;
-            // Move ant
-            ant.position += new float2(math.cos(ant.rotation * Mathf.Deg2Rad), math.sin(ant.rotation * Mathf.Deg2Rad)) * ant.speed * simData.SimulationTime;
             if (ant.position.x < -simData.WorldSize/2 || ant.position.x > simData.WorldSize/2 || ant.position.y < -simData.WorldSize/2 || ant.position.y > simData.WorldSize/2) {
-                ant.position = simData.NestPosition;
-                ant.rotation += 180f;
+                ant.rotation += 180 + random.NextFloat(float.Epsilon, 90);
                 ant.rotation = NormaliseAngle(ant.rotation);
             }
+            // Move ant
+            ant.position += new float2(math.cos(ant.rotation * Mathf.Deg2Rad), math.sin(ant.rotation * Mathf.Deg2Rad)) * ant.speed * simData.SimulationTime;
             antData.baseData = ant;
             simData.Ants[i] = antData;
         }
+        return simData;
+    }
+
+    public static AntSimulationData OrganiseLists(AntSimulationData simData) {
+        simData.Ants = simData.Ants.OrderByDescending(ant => ant.foodCollected).ThenByDescending(ant => ant.baseData.speed).ToList();
+        simData.Pheromones = simData.Pheromones.OrderBy(p => p.owner.isCarryingFood).ThenByDescending(p => (p.age / p.owner.pheromoneMaxAge)).ToList();
+        simData.FoodSources = simData.FoodSources.OrderByDescending(f => f.mass).ToList();
         return simData;
     }
 
@@ -467,12 +607,12 @@ public static class AntSimulationCore {
             simData = UpdateAntEnergy(simData);
             simData = UpdatePheromoneTimers(simData);
             simData = LocationCheck(simData);
+            simData = UpdateAntDirections(simData);
             if (simData.Pheromones.Count > 0) {
                 simData = ClearPheromonesInRangeAndPositionSensors(simData);
                 simData = UpdatePheromonesInRange(simData);
             }
             simData = UpdateAntRotations(simData);
-            simData = UpdateAntDirections(simData);
             simData = MoveAnts(simData); // Move ants
         }
         simData = UpdateFoodSources(simData);
@@ -551,19 +691,29 @@ public static class AntSimulationCore {
     }
 
     public static AntSimulationData UpdateAntRotations(AntSimulationData simData) {
-        for (int i = 0; i < simData.Ants.Count; i++) {
-            AntData antData = simData.Ants[i]; // Get the struct
-            AntJobData ant = antData.baseData;
-            antData.sensorStrengths = new float[3] {0, 0, 0}; // Initialize sensor strengths to zero
-            if (antData.pheromonesInRange.Count > 0) {
-                foreach (PheromoneData pheromone in antData.pheromonesInRange) {
-                    for (int j = 0; j < antData.sensorPositions.Length; j++) {
-                        antData.sensorStrengths[j] += CalculatePheromoneConcentration(simData, antData, pheromone, j);
+        int pheromoneCount = simData.Pheromones.Count;
+        if (pheromoneCount > 0) {
+            for (int i = 0; i < simData.Ants.Count; i++) {
+                AntData antData = simData.Ants[i]; // Get the struct
+                antData.sensorStrengths = new float[3] {0, 0, 0}; // Initialize sensor strengths to zero
+                simData.Ants[i] = antData;
+            }
+            for (int pheromone = 0; pheromone < pheromoneCount; pheromone++) {
+                for (int i = 0; i < simData.Ants.Count; i++) {
+                    AntData antData = simData.Ants[i]; // Get the struct
+                    if(antData.pheromoneIndiciesInRange.Contains(pheromone)) {
+                        for (int j = 0; j < 3; j++) {
+                            antData.sensorStrengths[j] += CalculatePheromoneConcentration(simData, antData, simData.Pheromones[pheromone], j);
+                        }
                     }
                 }
+            }
+            for (int i = 0; i < simData.Ants.Count; i++) {
+                AntData antData = simData.Ants[i]; // Get the struct
+                AntJobData ant = antData.baseData;
                 // Normalize sensor strengths
                 for (int j = 0; j < 3; j++) {
-                    if (antData.sensorStrengths[j] != 0) antData.sensorStrengths[j] /= antData.pheromonesInRange.Count;
+                    if (antData.sensorStrengths[j] != 0) antData.sensorStrengths[j] /= antData.pheromoneIndiciesInRange.Count;
                 }
                 bool leftSensorStrongest = (antData.sensorStrengths[1] >= antData.sensorStrengths[0] && antData.sensorStrengths[1] > antData.sensorStrengths[2]);
                 bool rightSensorStrongest = (antData.sensorStrengths[2] >= antData.sensorStrengths[0] && antData.sensorStrengths[2] > antData.sensorStrengths[1]);
@@ -573,9 +723,9 @@ public static class AntSimulationCore {
                 // Apply the rotation
                 ant.rotation += rotationChange;
                 ant.rotation = NormaliseAngle(ant.rotation);
+                antData.baseData = ant;
+                simData.Ants[i] = antData;
             }
-            antData.baseData = ant;
-            simData.Ants[i] = antData;
         }
         return simData;
     }
@@ -609,7 +759,7 @@ public static class AntSimulationCore {
         for(int i = 0; i < simData.Pheromones.Count; i++) {
             PheromoneData pheromone = simData.Pheromones[i];
             if (Vector2.Distance(pheromone.position, ant.position) <= ant.pheromoneMergeRadius) {
-                if(pointsToFood == pheromone.owner.isCarryingFood) {
+                if(pheromone.owner.isCarryingFood == 0 ||  pointsToFood == 1) {
                     simData.Pheromones.RemoveAt(i);
                     i--; // Adjust index after removal
                 }
@@ -642,7 +792,7 @@ public static class AntSimulationCore {
 
 public interface ISimulationRenderer {
     void Initialize();
-    void Draw(AntSimulationData data);
+    void Draw(AntSimulationData data, bool drawPheromones);
     void CleanUp();
 }
 #region Structs
@@ -653,6 +803,7 @@ public struct AntSimulationData {
     public float2 NestPosition;
     public float NestSize;
     public float WorldSize;
+    public int PheromoneThreshold;
     public List<AntData> Ants;
     public List<PheromoneData> Pheromones;
     public List<FoodSource> FoodSources;
@@ -687,9 +838,10 @@ public struct AntJobData {
 [System.Serializable]
 public struct AntData {
     public AntJobData baseData;
-    public List<PheromoneData> pheromonesInRange;
+    public HashSet<int> pheromoneIndiciesInRange;
     public float2[] sensorPositions;
     public float[] sensorStrengths;
+    public int foodCollected;
 }
 
 [System.Serializable]
@@ -710,11 +862,9 @@ public struct FoodSource {
 public struct CreateAntsJob : IJobParallelFor {
     [ReadOnly] public float2 NestPosition;
     [ReadOnly] public float NestSize;
-    public uint Seed;
     [WriteOnly] public NativeArray<AntJobData> Ants;
 
     public void Execute(int index) {
-        var random = new Unity.Mathematics.Random(Seed + (uint)index);
         Ants[index] = AntSimulationCore.CreateAnt(NestPosition, NestSize);
     }
 }
@@ -735,30 +885,35 @@ public struct UpdatePheromoneAgeJob : IJobParallelFor {
 }
 
 [BurstCompile]
-public struct UpdatePheromonesInRangeJob : IJobParallelFor {
+public struct ProcessPheromonesJob : IJob {
     [ReadOnly] public NativeArray<AntJobData> Ants;
     [ReadOnly] public NativeArray<PheromoneData> Pheromones;
     [ReadOnly] public NativeArray<float2> SensorPositions; // Flattened array: 3 sensors per ant
-    [WriteOnly] public UnsafeParallelMultiHashMap<int, PheromoneData>.ParallelWriter PheromonesInRangeMap;
-    public NativeParallelHashSet<int>.ParallelWriter AntsProcessedMap;
+    public UnsafeParallelMultiHashMap<int, int> PheromonesInRangeMap; // Each job has its own map
+    public int StartIndex;
+    public int EndIndex;
 
-    public void Execute(int index) {
-        PheromoneData pheromone = Pheromones[index];
-        for (int antIndex = 0; antIndex < Ants.Length; antIndex++) {
-            AntJobData ant = Ants[antIndex];
-            // Check each of the ant's 3 sensors
-            for (int s = 0; s < 3; s++) {
-                int sensorIdx = (antIndex * 3) + s;
-                float2 sensorPos = SensorPositions[sensorIdx];
-                float dist = math.distance(sensorPos, pheromone.position);
-                if (dist <= ant.sensorRadius) {
-                    
-                    // Check if the pheromone has already been added for this ant
-                    if(AntsProcessedMap.Add(antIndex)) {
-                        PheromonesInRangeMap.Add(antIndex, pheromone);
+    public void Execute() {
+        for (int pheromoneIndex = StartIndex; pheromoneIndex < EndIndex; pheromoneIndex++) {
+            bool relevant = false;
+            PheromoneData pheromone = Pheromones[pheromoneIndex];
+            for (int antIndex = 0; antIndex < Ants.Length; antIndex++) {
+                AntJobData ant = Ants[antIndex];
+                // Check each of the ant's 3 sensors
+                for (int s = 0; s < 3; s++) {
+                    int sensorIdx = (antIndex * 3) + s;
+                    float2 sensorPos = SensorPositions[sensorIdx];
+                    float dist = math.distance(sensorPos, pheromone.position);
+                    if (dist <= ant.sensorRadius) {
+                        PheromonesInRangeMap.Add(antIndex, pheromoneIndex);
+                        relevant = true;
                         break; // No need to check other sensors
                     }
                 }
+            }
+            if (!relevant) {
+                // Mark this pheromone for removal
+                PheromonesInRangeMap.Add(-1, pheromoneIndex);
             }
         }
     }
