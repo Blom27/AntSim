@@ -55,20 +55,8 @@ public class AntSimulationController : MonoBehaviour {
             }
             else _simulationData = AntSimulationCore.Update(_simulationData, Time.deltaTime * simulationSpeed);
             _simulationData = AntSimulationCore.OrganiseLists(_simulationData);
-            int antCount = _simulationData.Ants.Count;
-            int colonySize = _simulationData.ColonySize;
-            if(antCount <= colonySize * 0.5) {
-                int diff = colonySize - antCount;
-                for (int i = 0; i < diff / 2; i++) {
-                    _simulationData.Ants.Add(new AntData {
-                        baseData = AntSimulationCore.CreateOffspring(_simulationData, math.max(2, (int)(diff / 10))),
-                        pheromoneIndiciesInRange = new HashSet<int>(),
-                        foodCollected = 0
-                    });
-                }
-                antCount = _simulationData.Ants.Count;
-            }
         }
+        _simulationData = AntSimulationCore.AntCountCheck(_simulationData);
         if(_simulationData.Pheromones.Count >= pheromoneThreshold * 1.1) {
             for(int i = 0; i < pheromoneThreshold * pheromoneTrimPercentage; i++) {
                 _simulationData.Pheromones.RemoveAt(0);
@@ -328,7 +316,6 @@ public class GizmoRenderer : ISimulationRenderer {
 }
 
 public static class AntSimulationCore {
-    public static AntSimulationData currentState;
 
     public static Unity.Mathematics.Random random = new Unity.Mathematics.Random((uint)System.DateTime.Now.Millisecond);
 
@@ -368,15 +355,15 @@ public static class AntSimulationCore {
 
         float rotation = random.NextFloat(0, 360f);
 
-        float PheromoneIntervalValue = random.NextFloat(0f, 1f);
-        float PheromoneDecayRate = random.NextFloat(0f, 0.1f);
-        float PheromoneMaxAge = PheromoneIntervalValue / PheromoneDecayRate;
-        float PheromoneMergeRadius = random.NextFloat(float.Epsilon, 1f) * 0.05f;
-        float Speed = random.NextFloat(0f, 1f) * 2;
-        float RotationSpeed = random.NextFloat(0f, 360f) / 2;
-        float MaxEnergy = ((PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge)) * 10;
-        float SensorAngle = random.NextFloat(30f, 60f); // Randomize sensor angle
-        float SensorRadius= random.NextFloat(0.5f, 1f) * 2;
+        float PheromoneIntervalValue = random.NextFloat(0.05f, 1) * 2.5f;
+        float PheromoneDecayRate = random.NextFloat(0.001f, 0.03f);
+        float Speed = random.NextFloat(0.01f, 1) * 2;
+        float RotationSpeed = random.NextFloat(5, 360) / 2;
+        float SensorAngle = random.NextFloat(15, 90); // Randomize sensor angle
+        float SensorRadius = random.NextFloat(0.5f, 1) * 2;
+        float PheromoneMergeRadius = (random.NextFloat(0.01f, 1f) * 0.25f) * SensorRadius;
+        float MaxEnergy = ((((PheromoneDecayRate / 10) + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue * PheromoneDecayRate)) / (SensorAngle / 91)) * random.NextInt(25, 150);
+        float EnergyConsumptionRate = ((MaxEnergy / 10) / ((PheromoneDecayRate * PheromoneIntervalValue) * Speed * (RotationSpeed / 180))) / 100;
 
         return new AntJobData {
             position = position,
@@ -386,19 +373,19 @@ public static class AntSimulationCore {
             pheromoneTimer = 0f,
             pheromoneIntervalValue = PheromoneIntervalValue,
             pheromoneDecayRate = PheromoneDecayRate,
-            pheromoneMaxAge = PheromoneMaxAge,
             pheromoneMergeRadius = PheromoneMergeRadius,
 
             sensorRadius = SensorRadius,
             sensorAngle = SensorAngle,
-            smellRadius = (3 - SensorRadius) / 2,
+            smellRadius = (2 / SensorRadius),
 
             speed = Speed,
             rotationSpeed = RotationSpeed,
+
             maxEnergy = MaxEnergy,
             energy = MaxEnergy,
-            energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / MaxEnergy
-
+            energyConsumptionRate = EnergyConsumptionRate,
+            pheromoneMaxAge = (PheromoneDecayRate * PheromoneIntervalValue) * (MaxEnergy / EnergyConsumptionRate)
         };
     }
 
@@ -408,16 +395,14 @@ public static class AntSimulationCore {
         float rotation = 0;
         float PheromoneIntervalValue = 0;
         float PheromoneDecayRate = 0;
-        float PheromoneMaxAge = PheromoneIntervalValue / PheromoneDecayRate;
         float PheromoneMergeRadius = 0;
         float Speed = 0;
         float RotationSpeed = 0;
-        float MaxEnergy = ((PheromoneDecayRate + PheromoneMergeRadius + Speed + (RotationSpeed / 360)) / (PheromoneIntervalValue + PheromoneMaxAge)) * 10;
-        float SensorAngle = 0; // Randomize sensor angle
+        float SensorAngle = 0;
         float SensorRadius= 0;
-        float SmellRadius = (3 - SensorRadius) / 2;
+        float MaxEnergy = 0;
         for(int i = 0; i < parentCount; i++) {
-            int randomIndex = random.NextInt(0, simData.ColonySize / 10);
+            int randomIndex = (random.NextFloat(0, 1) < 0.02f) ? random.NextInt(0, simData.Ants.Count / 10) : 0;
             rotation += simData.Ants[i + randomIndex].baseData.rotation;
             PheromoneIntervalValue += simData.Ants[i + randomIndex].baseData.pheromoneIntervalValue;
             PheromoneDecayRate += simData.Ants[i + randomIndex].baseData.pheromoneDecayRate;
@@ -426,6 +411,7 @@ public static class AntSimulationCore {
             RotationSpeed += simData.Ants[i + randomIndex].baseData.rotationSpeed;
             SensorAngle += simData.Ants[i + randomIndex].baseData.sensorAngle;
             SensorRadius += simData.Ants[i + randomIndex].baseData.sensorRadius;
+            MaxEnergy += simData.Ants[i + randomIndex].baseData.maxEnergy;
         }
         rotation /= parentCount;
         PheromoneIntervalValue /= parentCount;
@@ -435,16 +421,19 @@ public static class AntSimulationCore {
         RotationSpeed /= parentCount;
         SensorAngle /= parentCount;
         SensorRadius /= parentCount;
+        MaxEnergy /= parentCount;
+        PheromoneMergeRadius *= SensorRadius;
+        float SmellRadius = (2 / SensorRadius);
+        float EnergyConsumptionRate = ((MaxEnergy / 10) / ((PheromoneDecayRate * PheromoneIntervalValue) * Speed * (RotationSpeed / 180))) / 100;
 
         return new AntJobData {
             position = position,
-            rotation = rotation,
+            rotation = NormaliseAngle(rotation + 180),
             isCarryingFood = 0,
 
             pheromoneTimer = 0f,
             pheromoneIntervalValue = PheromoneIntervalValue,
             pheromoneDecayRate = PheromoneDecayRate,
-            pheromoneMaxAge = PheromoneMaxAge,
             pheromoneMergeRadius = PheromoneMergeRadius,
 
             sensorRadius = SensorRadius,
@@ -455,7 +444,8 @@ public static class AntSimulationCore {
             rotationSpeed = RotationSpeed,
             maxEnergy = MaxEnergy,
             energy = MaxEnergy,
-            energyConsumptionRate = (PheromoneMaxAge * Speed * (RotationSpeed / 180)) / MaxEnergy
+            energyConsumptionRate = EnergyConsumptionRate,
+            pheromoneMaxAge = (PheromoneDecayRate * PheromoneIntervalValue) * (MaxEnergy / EnergyConsumptionRate)
         };
     }
 
@@ -511,7 +501,7 @@ public static class AntSimulationCore {
             AntData antData = simData.Ants[i]; // Get the struct
             AntJobData ant = antData.baseData;
             // Update ant energy
-            ant.energy -= ant.energyConsumptionRate * simData.SimulationTime;
+            ant.energy -= (ant.energyConsumptionRate * simData.SimulationTime);
             if (ant.energy <= 0) {
                 simData.Ants.RemoveAt(i);
                 i--;
@@ -519,6 +509,25 @@ public static class AntSimulationCore {
             else {
                 antData.baseData = ant;
                 simData.Ants[i] = antData;
+            }
+        }
+        simData = AntCountCheck(simData);
+        return simData;
+    }
+
+    public static AntSimulationData AntCountCheck(AntSimulationData simData) {
+        int antCount = simData.Ants.Count;
+        int colonySize = simData.ColonySize;
+        if(antCount <= colonySize * 0.25) {
+            int diff = colonySize - antCount;
+            for (int i = 0; i < diff; i++) {
+                simData.Ants.Add(new AntData {
+                    baseData = AntSimulationCore.CreateOffspring(simData, math.min(antCount, diff / 10)),
+                    pheromoneIndiciesInRange = new HashSet<int>(),
+                    foodCollected = 0
+                });
+                antCount = simData.Ants.Count;
+                diff = colonySize - antCount;
             }
         }
         return simData;
@@ -595,7 +604,7 @@ public static class AntSimulationCore {
     }
 
     public static AntSimulationData OrganiseLists(AntSimulationData simData) {
-        simData.Ants = simData.Ants.OrderByDescending(ant => ant.foodCollected).ThenByDescending(ant => ant.baseData.speed).ToList();
+        simData.Ants = simData.Ants.OrderByDescending(ant => ant.foodCollected).ThenByDescending(ant => ant.baseData.energy / ant.baseData.energyConsumptionRate).ThenByDescending(ant => ant.baseData.speed).ToList();
         simData.Pheromones = simData.Pheromones.OrderBy(p => p.owner.isCarryingFood).ThenByDescending(p => (p.age / p.owner.pheromoneMaxAge)).ToList();
         simData.FoodSources = simData.FoodSources.OrderByDescending(f => f.mass).ToList();
         return simData;
@@ -675,7 +684,7 @@ public static class AntSimulationCore {
                     }
                 }
                 if (closestSource != null) {
-                    if (closestFoodDistance <= ant.smellRadius + closestSource.Value.size) {
+                    if (closestFoodDistance <= ant.smellRadius + (closestSource.Value.size / 2)) {
                         Vector2 dirToFood = (float2)closestSource.Value.position - ant.position;
                         float targetAngle = Mathf.Atan2(dirToFood.y, dirToFood.x) * Mathf.Rad2Deg;
                         float angleDiff = Mathf.DeltaAngle(ant.rotation, targetAngle);
@@ -738,12 +747,15 @@ public static class AntSimulationCore {
         if (sensorDistanceToPheromone <= ant.sensorRadius && relevantPheromone) {
             float distanceHome = Vector2.Distance(pheromone.position, simData.NestPosition);
             float antDistanceHome = Vector2.Distance(ant.position, simData.NestPosition);
+
             float distanceRatio = (ant.isCarryingFood == 1) ? antDistanceHome / (distanceHome + float.Epsilon) : distanceHome / (antDistanceHome + float.Epsilon);
-            float directionStrength = (ant.isCarryingFood == 1) ? ((distanceHome < antDistanceHome) ? distanceRatio : -distanceRatio) :
-                                                                ((distanceHome > antDistanceHome) ? distanceRatio : -distanceRatio);
-            float distanceStrength = distanceHome / directionStrength;
-            float sensorDistanceStrength = sensorDistanceToPheromone / ant.sensorRadius;
-            totalStrength = (distanceStrength * sensorDistanceStrength);
+            float directionStrength = (ant.isCarryingFood == 1) ? ((distanceHome < antDistanceHome) ? distanceRatio * 2 : -distanceRatio) :
+                                                                ((distanceHome > antDistanceHome) ? distanceRatio * 2 : -distanceRatio);
+            float freshness = ((pheromone.owner.pheromoneMaxAge + 0.001f) / (pheromone.age + 0.001f));
+
+            float distanceStrength = (directionStrength) * (1 / freshness);
+            float sensorDistanceStrength = (ant.sensorRadius / sensorDistanceToPheromone) * (antDistanceHome / (distanceHome + float.Epsilon)) * (freshness);
+            totalStrength = ((sensorDistanceStrength) * (distanceStrength));
         }
         return totalStrength;
     }
